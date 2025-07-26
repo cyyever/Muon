@@ -26,6 +26,5 @@ classifiers = [
         'Programming Language :: Python :: 3.11',
 ]
 
-
 [project.urls]
 Repository = "https://github.com/KellerJordan/Muon"

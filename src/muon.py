@@ -1,7 +1,5 @@
 import torch
-from typing import Any, Callable, Optional
-from collections.abc import Iterable
-import torch.distributed as dist
+from typing import Callable, Optional
 from torch.optim.optimizer import ParamsT
 
 
