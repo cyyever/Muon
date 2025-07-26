@@ -54,6 +54,16 @@ def muon_update(
     return update
 
 
+def muon_update_cyy(
+    update: torch.Tensor,
+    ns_steps: int = 5,
+) -> torch.Tensor:
+    if update.ndim == 4:  # for the case of conv filters
+        update = update.view(len(update), -1)
+    update = zeropower_via_newtonschulz5(update, steps=ns_steps)
+    return update
+
+
 class Muon(torch.optim.Optimizer):
     """
     Muon - MomentUm Orthogonalized by Newton-schulz
@@ -296,6 +306,77 @@ class MuonWithAuxAdam(torch.optim.Optimizer):
                     )
                     p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update, alpha=-group["lr"])
+
+        return loss
+
+
+class MuonWithAuxAdamCyy(torch.optim.AdamW):
+    """
+    Distributed Muon variant that can be used for all parameters in the network, since it runs an
+    internal AdamW for the parameters that are not compatible with Muon. The user must manually
+    specify which parameters shall be optimized with Muon and which with Adam by passing in a
+    list of param_groups with the `use_muon` flag set.
+
+    The point of this class is to allow the user to have a single optimizer in their code, rather
+    than having both a Muon and an Adam which each need to be stepped.
+
+    You can see an example usage below:
+
+    https://github.com/KellerJordan/modded-nanogpt/blob/master/records/052525_MuonWithAuxAdamExample/b01550f9-03d8-4a9c-86fe-4ab434f1c5e0.txt#L470
+    ```
+    hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
+    embed_params = [p for n, p in model.named_parameters() if "embed" in n]
+    scalar_params = [p for p in model.parameters() if p.ndim < 2]
+    head_params = [model.lm_head.weight]
+
+    from muon import MuonWithAuxAdam
+    adam_groups = [dict(params=head_params, lr=0.22), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
+    adam_groups = [dict(**g, betas=(0.8, 0.95), eps=1e-10, use_muon=False) for g in adam_groups]
+    muon_group = dict(params=hidden_matrix_params, lr=0.05, momentum=0.95, use_muon=True)
+    param_groups = [*adam_groups, muon_group]
+    optimizer = MuonWithAuxAdam(param_groups)
+    ```
+    """
+
+    def __init__(self, params: ParamsT, *args, **kwargs) -> None:
+        muon_group = [p for p in params if p.ndim >= 2]
+        no_muon_group = [p for p in params if p.ndim < 2]
+        super().__init__(params=no_muon_group, *args, **kwargs)
+        self.muon_group = muon_group
+        self.muon_state = {p: {} for p in self.muon_group}
+
+    @torch.no_grad()
+    def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
+        assert len(super().param_groups) == 1
+        loss = super().step()
+        assert loss is None
+        momentum = super().param_groups[0]["momentum"]
+        lr = super().param_groups[0]["lr"]
+        weight_decay = super().param_groups[0]["weight_decay"]
+
+        for p in self.muon_group:
+            assert isinstance(p, torch.Tensor)
+
+            if p.grad is None:
+                # continue
+                p.grad = torch.zeros_like(p)  # Force synchronization
+            grad = p.grad
+            if weight_decay != 0:
+                grad = grad.add(p, alpha=weight_decay)
+
+            if momentum != 0:
+                buf = self.muon_state[p].get("momentum_buffer")
+
+                if buf is None:
+                    buf = torch.clone(grad).detach()
+                    self.muon_state[p]["momentum_buffer"] = buf
+                else:
+                    buf.mul_(momentum).add_(grad)
+                grad = buf
+
+            update = muon_update_cyy(grad)
+            assert update.shape == p.shape
+            p.add_(update, alpha=-lr)
 
         return loss
 
